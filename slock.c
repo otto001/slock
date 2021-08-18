@@ -1,5 +1,4 @@
 /* See LICENSE file for license details. */
-#define _XOPEN_SOURCE 500
 #if HAVE_SHADOW_H
 #include <shadow.h>
 #endif
@@ -8,54 +7,50 @@
 #include <errno.h>
 #include <grp.h>
 #include <pwd.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/Xft/Xft.h>
 
 #include "arg.h"
 #include "util.h"
+#include "drw.h"
+
+#define LENGTH(X)             (sizeof X / sizeof X[0])
+#define TEXTW(DRW, X)                (drw_fontset_getwidth(DRW, (X)) + lrpad)
 
 char *argv0;
+int scheme = 0;
+static char stext[256];
+Display *dpy;
+
+static int bh, lrpad = 0;
 
 enum {
-	INIT,
-	INPUT,
-	FAILED,
-	NUMCOLS
+    SchemeNorm, SchemeInput, SchemeFailed, SchemeBar, SchemeLast
 };
 
-struct lock {
+struct Lock {
 	int screen;
 	Window root, win;
-	Pixmap pmap;
-	unsigned long colors[NUMCOLS];
+	Drw *drw;
+	Clr *scheme[SchemeLast];
+	int w, h;
 };
 
-struct xrandr {
+struct Xrandr {
 	int active;
 	int evbase;
 	int errbase;
 };
 
 #include "config.h"
-
-static void
-die(const char *errstr, ...)
-{
-	va_list ap;
-
-	va_start(ap, errstr);
-	vfprintf(stderr, errstr, ap);
-	va_end(ap);
-	exit(1);
-}
 
 #ifdef __linux__
 #include <fcntl.h>
@@ -82,6 +77,53 @@ dontkillme(void)
 	}
 }
 #endif
+
+
+int
+gettextprop(Window w, Atom atom, char *text, unsigned int size)
+{
+    char **list = NULL;
+    int n;
+    XTextProperty name;
+
+    if (!text || size == 0)
+        return 0;
+    text[0] = '\0';
+    if (!XGetTextProperty(dpy, w, &name, atom) || !name.nitems)
+        return 0;
+    if (name.encoding == XA_STRING)
+        strncpy(text, (char *)name.value, size - 1);
+    else {
+        if (XmbTextPropertyToTextList(dpy, &name, &list, &n) >= Success && n > 0 && *list) {
+            strncpy(text, *list, size - 1);
+            XFreeStringList(list);
+        }
+    }
+    text[size - 1] = '\0';
+    XFree(name.value);
+    return 1;
+}
+
+static void
+cleanup(struct Lock **locks, int nscreens) {
+    int screen;
+    struct Lock* lock;
+
+    for (screen = 0; screen < nscreens; screen++) {
+        lock = locks[screen];
+
+        XUngrabKey(dpy, AnyKey, AnyModifier, lock->root);
+
+        for (size_t i = 0; i < SchemeLast; i++) {
+            free(lock->scheme[i]);
+        }
+
+        drw_free(lock->drw);
+        XSync(dpy, False);
+        XCloseDisplay(dpy);
+    }
+}
+
 
 static const char *
 gethash(void)
@@ -124,21 +166,40 @@ gethash(void)
 	return hash;
 }
 
+
 static void
-readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
+draw(struct Lock *lock) {
+    int tw = 0;
+    drw_setscheme(lock->drw, lock->scheme[scheme]);
+    drw_rect(lock->drw, 0, 0, lock->w, lock->h, 1, 1);
+
+    drw_setscheme(lock->drw, lock->scheme[SchemeBar]);
+    drw_rect(lock->drw, 0, 0, lock->w, bh, 1, 1);
+
+    if (!gettextprop(lock->root, XA_WM_NAME, stext, sizeof(stext)))
+        strcpy(stext, "slock-"VERSION);
+
+    tw = TEXTW(lock->drw, stext) - lrpad + 2; /* 2px right padding */
+    drw_text(lock->drw, lock->w - tw, 0, tw, bh, 0, stext, 0);
+
+    drw_map(lock->drw, lock->win, 0, 0, lock->w, lock->h);
+}
+
+static void
+readpw(struct Xrandr *rr, struct Lock **locks, int nscreens,
        const char *hash)
 {
 	XRRScreenChangeNotifyEvent *rre;
 	char buf[32], passwd[256], *inputhash;
-	int num, screen, running, failure, oldc;
-	unsigned int len, color;
+	int num, screen, running, failure, oldScheme;
+	unsigned int len;
 	KeySym ksym;
 	XEvent ev;
 
 	len = 0;
 	running = 1;
 	failure = 0;
-	oldc = INIT;
+    oldScheme = SchemeNorm;
 
 	while (running && !XNextEvent(dpy, &ev)) {
 		if (ev.type == KeyPress) {
@@ -165,7 +226,9 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				else
 					running = !!strcmp(inputhash, hash);
 				if (running) {
-					XBell(dpy, 100);
+				    if (bellOnFail) {
+                        XBell(dpy, 100);
+                    }
 					failure = 1;
 				}
 				explicit_bzero(&passwd, sizeof(passwd));
@@ -187,15 +250,12 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				}
 				break;
 			}
-			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
-			if (running && oldc != color) {
+			scheme = len ? SchemeInput : ((failure || failOnClear) ? SchemeFailed : SchemeNorm);
+			if (running && oldScheme != scheme) {
 				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
-					XClearWindow(dpy, locks[screen]->win);
-				}
-				oldc = color;
+                    draw(locks[screen]);
+                }
+                oldScheme = scheme;
 			}
 		} else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
 			rre = (XRRScreenChangeNotifyEvent*)&ev;
@@ -213,50 +273,64 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				}
 			}
 		} else {
-			for (screen = 0; screen < nscreens; screen++)
-				XRaiseWindow(dpy, locks[screen]->win);
+		    if (ev.type == NoExpose || ev.type == GraphicsExpose) {
+		        usleep(16666);
+		    }
+			for (screen = 0; screen < nscreens; screen++) {
+                XRaiseWindow(dpy, locks[screen]->win);
+                draw(locks[screen]);
+            }
 		}
 	}
 }
 
-static struct lock *
-lockscreen(Display *dpy, struct xrandr *rr, int screen)
+static struct Lock *
+lockscreen(struct Xrandr *rr, int screen)
 {
-	char curs[] = {0, 0, 0, 0, 0, 0, 0, 0};
 	int i, ptgrab, kbgrab;
-	struct lock *lock;
-	XColor color, dummy;
+	struct Lock *lock;
+	XColor initBackground, dummy;
 	XSetWindowAttributes wa;
 	Cursor invisible;
 
-	if (dpy == NULL || screen < 0 || !(lock = malloc(sizeof(struct lock))))
+	if (dpy == NULL || screen < 0 || !(lock = malloc(sizeof(struct Lock))))
 		return NULL;
 
 	lock->screen = screen;
 	lock->root = RootWindow(dpy, lock->screen);
 
-	for (i = 0; i < NUMCOLS; i++) {
-		XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
-		                 colorname[i], &color, &dummy);
-		lock->colors[i] = color.pixel;
-	}
 
 	/* init */
+    XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
+                     colors[SchemeNorm][ColBg], &initBackground, &dummy);
 	wa.override_redirect = 1;
-	wa.background_pixel = lock->colors[INIT];
+	wa.background_pixel = initBackground.pixel;
+	lock->w = DisplayWidth(dpy, lock->screen);
+    lock->h = DisplayHeight(dpy, lock->screen);
 	lock->win = XCreateWindow(dpy, lock->root, 0, 0,
-	                          DisplayWidth(dpy, lock->screen),
-	                          DisplayHeight(dpy, lock->screen),
+                              lock->w,
+                              lock->h,
 	                          0, DefaultDepth(dpy, lock->screen),
 	                          CopyFromParent,
 	                          DefaultVisual(dpy, lock->screen),
 	                          CWOverrideRedirect | CWBackPixel, &wa);
-	lock->pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
-	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
-	                                &color, &color, 0, 0);
-	XDefineCursor(dpy, lock->win, invisible);
 
-	/* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
+    lock->drw = drw_create(dpy, screen, lock->root, lock->w, lock->h);
+
+    for (i = 0; i < SchemeLast; i++) {
+        lock->scheme[i] = drw_scm_create(lock->drw, colors[i], 2);
+    }
+    if (!drw_fontset_create(lock->drw, fonts, LENGTH(fonts)))
+        die("no fonts could be loaded.");
+
+    lrpad = lock->drw->fonts->h;
+    bh = lock->drw->fonts->h + 2;
+
+    invisible = XCreatePixmapCursor(dpy, lock->drw->drawable, lock->drw->drawable,
+                                    &initBackground, &initBackground, 0, 0);
+    XDefineCursor(dpy, lock->win, invisible);
+
+	/* Try to grab mouse pointer *and* keyboard for 600mqs, else fail the Lock */
 	for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {
 		if (ptgrab != GrabSuccess) {
 			ptgrab = XGrabPointer(dpy, lock->root, False,
@@ -269,7 +343,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 			                       GrabModeAsync, GrabModeAsync, CurrentTime);
 		}
 
-		/* input is grabbed: we can lock the screen */
+		/* input is grabbed: we can Lock the screen */
 		if (ptgrab == GrabSuccess && kbgrab == GrabSuccess) {
 			XMapRaised(dpy, lock->win);
 			if (rr->active)
@@ -294,6 +368,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	if (kbgrab != GrabSuccess)
 		fprintf(stderr, "slock: unable to grab keyboard for screen %d\n",
 		        screen);
+
 	return NULL;
 }
 
@@ -305,14 +380,13 @@ usage(void)
 
 int
 main(int argc, char **argv) {
-	struct xrandr rr;
-	struct lock **locks;
+	struct Xrandr rr;
+	struct Lock **locks;
 	struct passwd *pwd;
 	struct group *grp;
 	uid_t duid;
 	gid_t dgid;
 	const char *hash;
-	Display *dpy;
 	int s, nlocks, nscreens;
 
 	ARGBEGIN {
@@ -360,21 +434,21 @@ main(int argc, char **argv) {
 
 	/* get number of screens in display "dpy" and blank them */
 	nscreens = ScreenCount(dpy);
-	if (!(locks = calloc(nscreens, sizeof(struct lock *))))
+	if (!(locks = calloc(nscreens, sizeof(struct Lock *))))
 		die("slock: out of memory\n");
 	for (nlocks = 0, s = 0; s < nscreens; s++) {
-		if ((locks[s] = lockscreen(dpy, &rr, s)) != NULL)
+		if ((locks[s] = lockscreen(&rr, s)) != NULL)
 			nlocks++;
 		else
 			break;
 	}
 	XSync(dpy, 0);
 
-	/* did we manage to lock everything? */
+	/* did we manage to Lock everything? */
 	if (nlocks != nscreens)
 		return 1;
 
-	/* run post-lock command */
+	/* run post-Lock command */
 	if (argc > 0) {
 		switch (fork()) {
 		case -1:
@@ -389,7 +463,7 @@ main(int argc, char **argv) {
 	}
 
 	/* everything is now blank. Wait for the correct password */
-	readpw(dpy, &rr, locks, nscreens, hash);
-
+	readpw(&rr, locks, nscreens, hash);
+    cleanup(locks, nscreens);
 	return 0;
 }
