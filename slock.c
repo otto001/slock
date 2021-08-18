@@ -326,6 +326,7 @@ lockscreen(struct Xrandr *rr, int screen)
     lrpad = lock->drw->fonts->h;
     bh = lock->drw->fonts->h + 2;
 
+
     invisible = XCreatePixmapCursor(dpy, lock->drw->drawable, lock->drw->drawable,
                                     &initBackground, &initBackground, 0, 0);
     XDefineCursor(dpy, lock->win, invisible);
