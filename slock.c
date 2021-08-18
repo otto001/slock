@@ -25,11 +25,6 @@
 #define LENGTH(X)             (sizeof X / sizeof X[0])
 #define TEXTW(DRW, X)                (drw_fontset_getwidth(DRW, (X)) + lrpad)
 
-char *argv0;
-int scheme = 0;
-static char stext[256];
-Display *dpy;
-
 static int bh, lrpad = 0;
 
 enum {
@@ -49,6 +44,13 @@ struct Xrandr {
 	int evbase;
 	int errbase;
 };
+
+
+char *argv0;
+int scheme = SchemeNorm;
+static char stext[256];
+Display *dpy;
+
 
 #include "config.h"
 
@@ -201,6 +203,10 @@ readpw(struct Xrandr *rr, struct Lock **locks, int nscreens,
 	failure = 0;
     oldScheme = SchemeNorm;
 
+    for (screen = 0; screen < nscreens; screen++) {
+        draw(locks[screen]);
+    }
+
 	while (running && !XNextEvent(dpy, &ev)) {
 		if (ev.type == KeyPress) {
 			explicit_bzero(&buf, sizeof(buf));
@@ -287,11 +293,13 @@ readpw(struct Xrandr *rr, struct Lock **locks, int nscreens,
 static struct Lock *
 lockscreen(struct Xrandr *rr, int screen)
 {
+    char curs[] = {0, 0, 0, 0, 0, 0, 0, 0};
 	int i, ptgrab, kbgrab;
 	struct Lock *lock;
 	XColor initBackground, dummy;
 	XSetWindowAttributes wa;
 	Cursor invisible;
+    Pixmap pmap;
 
 	if (dpy == NULL || screen < 0 || !(lock = malloc(sizeof(struct Lock))))
 		return NULL;
@@ -326,8 +334,8 @@ lockscreen(struct Xrandr *rr, int screen)
     lrpad = lock->drw->fonts->h;
     bh = lock->drw->fonts->h + 2;
 
-
-    invisible = XCreatePixmapCursor(dpy, lock->drw->drawable, lock->drw->drawable,
+    pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
+    invisible = XCreatePixmapCursor(dpy, pmap, pmap,
                                     &initBackground, &initBackground, 0, 0);
     XDefineCursor(dpy, lock->win, invisible);
 
