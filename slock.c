@@ -279,7 +279,9 @@ readpw(struct Xrandr *rr, struct Lock **locks, int nscreens,
 				}
 			}
 		} else {
-		    if (ev.type == NoExpose || ev.type == GraphicsExpose) {
+		    if (ev.type == NoExpose) {
+		        while(XCheckTypedEvent(dpy, NoExpose, &ev)) {
+		        }
 		        usleep(16666);
 		    }
 			for (screen = 0; screen < nscreens; screen++) {
