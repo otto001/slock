@@ -10,7 +10,7 @@ static const char *colors[SchemeLast][3] = {
         [SchemeNorm] = { "#eeeeee", "#555555" },
         [SchemeInput] = { "#eeeeee", "#005577" },
         [SchemeFailed] = { "#eeeeee", "#CC3333" },
-        [SchemeBar] = { "#eeeeee", "#222222" },
+        [SchemeBar] = { "#bbbbbb", "#222222" },
 };
 
 
